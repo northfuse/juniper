@@ -44,7 +44,7 @@ use rocket::{
     data::{self, FromData, ToByteUnit},
     http::{ContentType, RawStr, Status},
     outcome::Outcome::{Failure, Forward, Success},
-    request::{FormItems, FromForm, FromFormValue},
+    form::{self, FromForm, FromFormField, ValueField, DataField},
     response::{self, content, Responder, Response},
     Data, Request,
 };
@@ -63,7 +63,7 @@ use juniper::{
 #[derive(Debug, PartialEq)]
 pub struct GraphQLRequest<S = DefaultScalarValue>(GraphQLBatchRequest<S>)
 where
-    S: ScalarValue;
+    S: ScalarValue + Send;
 
 /// Simple wrapper around the result of executing a GraphQL query
 pub struct GraphQLResponse(pub Status, pub String);
@@ -92,7 +92,7 @@ pub fn playground_source(
 
 impl<S> GraphQLRequest<S>
 where
-    S: ScalarValue,
+    S: ScalarValue + Send,
 {
     /// Synchronously execute an incoming GraphQL query.
     pub fn execute_sync<CtxT, QueryT, MutationT, SubscriptionT>(
@@ -158,7 +158,7 @@ impl GraphQLResponse {
     ///
     /// ```
     /// # use rocket::http::CookieJar;
-    /// # use rocket::request::Form;
+    /// # use rocket::form::Form;
     /// # use rocket::response::content;
     /// # use rocket::State;
     /// #
@@ -171,7 +171,7 @@ impl GraphQLResponse {
     /// fn get_graphql_handler(
     ///     cookies: &CookieJar,
     ///     context: State<Database>,
-    ///     request: Form<juniper_rocket_async::GraphQLRequest>,
+    ///     request: juniper_rocket_async::GraphQLRequest,
     ///     schema: State<Schema>,
     /// ) -> juniper_rocket_async::GraphQLResponse {
     ///     if cookies.get("user_id").is_none() {
@@ -199,55 +199,103 @@ impl GraphQLResponse {
     }
 }
 
-impl<'f, S> FromForm<'f> for GraphQLRequest<S>
+pub struct GraphQLRequestFormContext<S> where S: ScalarValue + Send {
+    opts : form::Options,
+    errors : Vec<String>,
+
+    query : Option<String>,
+    operation_name: Option<String>,
+    variables : Option<InputValue<S>>,
+}
+
+#[rocket::async_trait]
+impl<'r, S> FromForm<'r> for GraphQLRequest<S>
 where
-    S: ScalarValue,
+    S: ScalarValue + Send,
 {
-    type Error = String;
+    type Context = GraphQLRequestFormContext<S>;
 
-    fn from_form(form_items: &mut FormItems<'f>, strict: bool) -> Result<Self, String> {
-        let mut query = None;
-        let mut operation_name = None;
-        let mut variables = None;
+    fn init(opts: form::Options) -> Self::Context {
+        GraphQLRequestFormContext {
+            opts,
+            errors: vec![],
+            query: None,
+            operation_name: None,
+            variables: None,
+        }
+    }
 
-        for form_item in form_items {
-            let (key, value) = form_item.key_value();
+    fn push_value(ctxt: &mut Self::Context, field: ValueField<'r>) {
+        ctxt.push_value(field);
+    }
+
+    async fn push_data(ctxt: &mut Self::Context, field: DataField<'r, '_>) {
+        todo!()
+    }
+
+    fn finalize(ctxt: Self::Context) -> form::Result<'r, Self> {
+        if ctxt.errors.len() > 0 {
+            let e = ctxt.errors.get(0).unwrap().to_owned();
+            Err(rocket::form::error::ErrorKind::Validation(std::borrow::Cow::from(e)))?
+            //Err(ctxt.errors.iter().map(|e| rocket::form::error::ErrorKind::Custom(Box::new(e))))?
+        } if let Some(query) = ctxt.query {
+            Ok(GraphQLRequest(GraphQLBatchRequest::Single(
+                http::GraphQLRequest::new(query, ctxt.operation_name, ctxt.variables),
+            )))
+        } else {
+            Err(rocket::form::error::ErrorKind::Validation(std::borrow::Cow::from("Query parameter missing")))?
+        }
+    }
+}
+
+impl<S> GraphQLRequestFormContext<S> where S : ScalarValue + Send {
+    fn push_value<'r>(&mut self, field: ValueField<'r>) {
+        match self.do_push_value(field) {
+            Err(e) => self.errors.push(e),
+            Ok(_) => println!("success!")
+        };
+    }
+
+    fn do_push_value<'r>(&mut self, field: ValueField<'r>) -> Result<(), String> {
+        let strict = true;
+
             // Note: we explicitly decode in the match arms to save work rather
             // than decoding every form item blindly.
-            match key.as_str() {
+            let key = field.name.key().unwrap().as_str();
+            println!("{} = {}", key, field.value);
+            match key {
                 "query" => {
-                    if query.is_some() {
+                    if self.query.is_some() {
                         return Err("Query parameter must not occur more than once".to_owned());
                     } else {
-                        match value.url_decode() {
-                            Ok(v) => query = Some(v),
+                        let query = RawStr::new(field.value);
+                        match query.url_decode() {
+                            Ok(v) => self.query = Some(v.to_string()),
                             Err(e) => return Err(e.to_string()),
-                        }
+                        };
                     }
                 }
                 "operation_name" => {
-                    if operation_name.is_some() {
+                    if self.operation_name.is_some() {
                         return Err(
                             "Operation name parameter must not occur more than once".to_owned()
                         );
                     } else {
-                        match value.url_decode() {
-                            Ok(v) => operation_name = Some(v),
-                            Err(e) => return Err(e.to_string()),
-                        }
+                        self.operation_name = Some(field.value.to_owned());
                     }
                 }
                 "variables" => {
-                    if variables.is_some() {
+                    if self.variables.is_some() {
                         return Err("Variables parameter must not occur more than once".to_owned());
                     } else {
-                        let decoded;
-                        match value.url_decode() {
-                            Ok(v) => decoded = v,
+                        let raw_variables = RawStr::new(field.value);
+                        let variables;
+                        match raw_variables.url_decode() {
+                            Ok(v) => variables = v.to_string(),
                             Err(e) => return Err(e.to_string()),
-                        }
-                        variables = Some(
-                            serde_json::from_str::<InputValue<_>>(&decoded)
+                        };
+                        self.variables = Some(
+                            serde_json::from_str::<InputValue<S>>(&variables)
                                 .map_err(|err| err.to_string())?,
                         );
                     }
@@ -258,41 +306,21 @@ where
                     }
                 }
             }
+            Ok(())
         }
 
-        if let Some(query) = query {
-            Ok(GraphQLRequest(GraphQLBatchRequest::Single(
-                http::GraphQLRequest::new(query, operation_name, variables),
-            )))
-        } else {
-            Err("Query parameter missing".to_owned())
-        }
     }
-}
-
-impl<'v, S> FromFormValue<'v> for GraphQLRequest<S>
-where
-    S: ScalarValue,
-{
-    type Error = String;
-
-    fn from_form_value(form_value: &'v RawStr) -> Result<Self, Self::Error> {
-        let mut form_items = FormItems::from(form_value);
-
-        Self::from_form(&mut form_items, true)
-    }
-}
 
 const BODY_LIMIT: u64 = 1024 * 100;
 
 #[rocket::async_trait]
-impl<S> FromData for GraphQLRequest<S>
+impl<'r, S> FromData<'r> for GraphQLRequest<S>
 where
-    S: ScalarValue,
+    S: ScalarValue + Send,
 {
     type Error = String;
 
-    async fn from_data(req: &Request<'_>, data: Data) -> data::Outcome<Self, Self::Error> {
+    async fn from_data(req: &'r Request<'_>, data: Data) -> data::Outcome<Self, Self::Error> {
         use rocket::tokio::io::AsyncReadExt as _;
 
         let content_type = req
@@ -340,14 +368,16 @@ impl<'r, 'o: 'r> Responder<'r, 'o> for GraphQLResponse {
 mod fromform_tests {
     use super::*;
     use juniper::InputValue;
-    use rocket::request::{FormItems, FromForm};
+    use rocket::form::{Form, FromForm};
     use std::str;
 
-    fn check_error(input: &str, error: &str, strict: bool) {
-        let mut items = FormItems::from(input);
-        let result: Result<GraphQLRequest, _> = GraphQLRequest::from_form(&mut items, strict);
+    fn check_error(input: &str, error: &str, _strict: bool) {
+        let result = Form::<GraphQLRequest>::parse(input);
+        println!("result: {:?}", result);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), error);
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors.get(0).unwrap().kind, rocket::form::error::ErrorKind::Validation(std::borrow::Cow::from(error)));
     }
 
     #[test]
@@ -408,8 +438,7 @@ mod fromform_tests {
     #[test]
     fn test_variables_valid_json() {
         let form_string = r#"query=test&variables={"foo":"bar"}"#;
-        let mut items = FormItems::from(form_string);
-        let result = GraphQLRequest::from_form(&mut items, false);
+        let result = Form::<GraphQLRequest>::parse(form_string);
         assert!(result.is_ok());
         let variables = ::serde_json::from_str::<InputValue>(r#"{"foo":"bar"}"#).unwrap();
         let expected = GraphQLRequest(GraphQLBatchRequest::Single(http::GraphQLRequest::new(
@@ -423,8 +452,7 @@ mod fromform_tests {
     #[test]
     fn test_variables_encoded_json() {
         let form_string = r#"query=test&variables={"foo": "x%20y%26%3F+z"}"#;
-        let mut items = FormItems::from(form_string);
-        let result = GraphQLRequest::from_form(&mut items, false);
+        let result = Form::<GraphQLRequest>::parse(form_string);
         assert!(result.is_ok());
         let variables = ::serde_json::from_str::<InputValue>(r#"{"foo":"x y&? z"}"#).unwrap();
         let expected = GraphQLRequest(GraphQLBatchRequest::Single(http::GraphQLRequest::new(
@@ -438,8 +466,7 @@ mod fromform_tests {
     #[test]
     fn test_url_decode() {
         let form_string = "query=%25foo%20bar+baz%26%3F&operation_name=test";
-        let mut items = FormItems::from(form_string);
-        let result: Result<GraphQLRequest, _> = GraphQLRequest::from_form(&mut items, false);
+        let result = Form::<GraphQLRequest>::parse(form_string);
         assert!(result.is_ok());
         let expected = GraphQLRequest(GraphQLBatchRequest::Single(http::GraphQLRequest::new(
             "%foo bar baz&?".to_string(),
@@ -465,7 +492,7 @@ mod tests {
         http::ContentType,
         local::asynchronous::{Client, LocalResponse},
         post,
-        request::Form,
+        form::Form,
         routes, Rocket, State,
     };
 
@@ -474,7 +501,7 @@ mod tests {
     #[get("/?<request..>")]
     fn get_graphql_handler(
         context: State<Database>,
-        request: Form<super::GraphQLRequest>,
+        request: super::GraphQLRequest,
         schema: State<Schema>,
     ) -> super::GraphQLResponse {
         request.execute_sync(&schema, &context)

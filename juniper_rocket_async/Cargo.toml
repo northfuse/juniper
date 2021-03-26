@@ -14,9 +14,14 @@ repository = "https://github.com/graphql-rust/juniper"
 [dependencies]
 futures = "0.3.1"
 juniper = { version = "0.15.3", path = "../juniper", default-features = false }
-rocket = { git = "https://github.com/SergioBenitez/Rocket", branch = "master", default-features = false }
+#before from form
+#rocket = {git = "https://github.com/SergioBenitez/Rocket", rev = "2366bff05fe435977106106b918bb7e5a1d057df", default-features = false}
+#new form
+#rocket = {git = "https://github.com/SergioBenitez/Rocket", rev = "63a14525d86595a8033715e3bdcd2bf2581eecb1", default-features = false}
+rocket = {git = "https://github.com/SergioBenitez/Rocket", branch = "master", default-features = false}
 serde_json = "1.0.2"
 tokio = { version = "0.2", features = ["macros", "rt-core"] }
 
 [dev-dependencies]
 juniper = { version = "0.15.3", path = "../juniper", features = ["expose-test-schema"] }
+
